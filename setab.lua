@@ -6,16 +6,57 @@ Chat output is ASCII only (Japanese needs Shift-JIS conversion in the FFXI chat 
 
 _addon.name     = 'SetAB'
 _addon.author   = 'hikaruoshino'
-_addon.version  = '0.2.4'
+_addon.version  = '0.3.0'
 _addon.commands = {'setab', 'sab'}
 
 local res      = require('resources')
 local config   = require('config')
 local extdata  = require('extdata')
+local texts    = require('texts')
 local stats    = require('setab_stats')
 
-local defaults = {enabled = true, ignore = ''}
+-- Client language. A Japanese client's chat is Shift-JIS: chat output goes through to_shift_jis and command arguments
+-- (auto-translate words from Tab included) come back through convert_auto_trans + from_shift_jis, as in SkillUp / BoxOpener.
+local function client_is_ja()
+    local ok, info = pcall(windower.ffxi.get_info)
+    local l = ok and info and info.language and tostring(info.language):lower() or 'japanese'
+    return l == 'japanese'
+end
+
+local function sjis(str)
+    str = tostring(str)
+    if not client_is_ja() then return str end
+    return windower.to_shift_jis and windower.to_shift_jis(str) or str
+end
+
+local function from_sjis(str)
+    if not str then return nil end
+    local s = windower.convert_auto_trans and windower.convert_auto_trans(str) or str
+    if not client_is_ja() then return s end
+    return windower.from_shift_jis and windower.from_shift_jis(s) or s
+end
+
+local defaults = {enabled = true, ignore = '', hud_on = true, hud_tip = true, lang = 'auto', hud_font_v = 0}
+-- HUD (//setab compare shows it): libs/texts reads pos / text / bg / padding from the settings root and saves the position after a drag.
+-- MS Gothic on a Japanese client: fixed width for both ASCII (1 cell) and Japanese (2 cells), which the table layout assumes.
+defaults.pos = {x = 40, y = 330}
+defaults.text = {font = client_is_ja() and 'MS Gothic' or 'Consolas', size = 11, alpha = 255}
+defaults.bg = {alpha = 200, red = 10, green = 10, blue = 15}
+defaults.padding = 6
 local settings = config.load(defaults)
+if settings.hud_font_v ~= 1 then   -- one-time: the first 0.3.0 builds saved Consolas, which has no Japanese glyphs
+    settings.hud_font_v = 1
+    if client_is_ja() and settings.text.font == 'Consolas' then settings.text.font = 'MS Gothic' end
+    config.save(settings)
+end
+local HUD_SIZE_MIN, HUD_SIZE_MAX = 6, 40
+
+-- which language action names are shown in: settings.lang = auto (the client's) / ja / en
+local function use_ja()
+    local s = tostring(settings.lang or 'auto'):lower()
+    if s == 'ja' then return true elseif s == 'en' then return false end
+    return client_is_ja()
+end
 
 -- Windower's equipment slot names (ear1/ring1 etc. do not exist, so earrings and rings were never hashed before 0.2.2)
 local SLOTS = {'main','sub','range','ammo','head','neck','left_ear','right_ear',
@@ -69,8 +110,10 @@ local tp_prev, tp_prev_t = nil, 0
 local last_flush = os.clock()
 local filt = {tpmin = nil, tpmax = nil, target = nil}
 local debug_on = false   -- //setab debug on|off (temporary: prints the raw action values for in-game checks)
+local hud_state = nil     -- {a, b, action}: what the HUD table is showing (set by //setab compare); it refreshes as new rows come in
+local hud_dirty = false   -- new rows or a changed filter: refresh the HUD table in prerender
 
-local function say(msg) windower.add_to_chat(207, 'SetAB: ' .. msg) end
+local function say(msg) windower.add_to_chat(207, sjis('SetAB: ' .. msg)) end
 
 local function clean(s)
     return (tostring(s):gsub('[,\r\n\t]', ' '))
@@ -337,6 +380,7 @@ local function on_action(act)
         queue[#queue + 1] = table.concat({r.ts, r.zone, r.target, r.actor, r.action, r.cat,
             r.set, r.hash, r.tp, r.weather, r.day, r.buffs, r.result, r.dmg, r.msg, r.hits}, ',')
     end
+    if hud_state then hud_dirty = true end   -- the HUD table refreshes in prerender (at most once a second)
 end
 
 ---------------------------------------------------------------- reporting
@@ -355,12 +399,16 @@ end
 
 local function summarize(list)
     local dm, miss = {}, 0
+    local lo, hi
     for _, r in ipairs(list) do
-        if r.result == 'hit' then dm[#dm + 1] = r.dmg
+        if r.result == 'hit' then
+            dm[#dm + 1] = r.dmg
+            if not lo or r.dmg < lo then lo = r.dmg end
+            if not hi or r.dmg > hi then hi = r.dmg end
         elseif r.result == 'miss' or r.result == 'resist' then miss = miss + 1 end
     end
     return {
-        n = #list, hits = #dm, miss = miss, dm = dm,
+        n = #list, hits = #dm, miss = miss, dm = dm, min = lo, max = hi,
         mean = stats.mean(dm), med = stats.median(dm), ci = stats.ci95(dm),
     }
 end
@@ -368,11 +416,42 @@ end
 local function f0(x) return x and string.format('%.0f', x) or '-' end
 local function ci(x) return x and ('+-' .. string.format('%.0f', x)) or '+-?' end
 
+-- Action names are recorded in English (the CSV stays the same for both clients). The Japanese name of each is found in res
+-- (weapon skills, spells, job abilities, monster abilities) so lists can show it and Japanese can be typed (Tab included).
+local ja_of = nil
+local function build_names()
+    if ja_of then return end
+    ja_of = {}
+    for _, tbl in ipairs({res.weapon_skills, res.spells, res.job_abilities, res.monster_abilities}) do
+        for _, row in pairs(tbl or {}) do
+            if type(row) == 'table' and row.en and row.ja and not ja_of[row.en] then ja_of[row.en] = row.ja end
+        end
+    end
+end
+
+-- the name to show: Japanese when the client (or //setab lang ja) is Japanese and res has it
+local function disp(action)
+    if not use_ja() then return action end
+    build_names()
+    return ja_of[action] or action
+end
+
+-- does a recorded action match what was typed? English: part of the name, any case. Japanese: part of the Japanese name
+local function action_matches(action, want)
+    if string.find(string.lower(action), want, 1, true) then return true end
+    if string.find(want, '[\128-\255]') then
+        build_names()
+        local ja = ja_of[action]
+        return ja ~= nil and string.find(ja, want, 1, true) ~= nil
+    end
+    return false
+end
+
 local function matching(actionname)
     local out = {}
     local want = actionname and string.lower(actionname)
     for _, r in ipairs(rows) do
-        if passes(r) and (not want or string.find(string.lower(r.action), want, 1, true)) then
+        if passes(r) and (not want or action_matches(r.action, want)) then
             out[#out + 1] = r
         end
     end
@@ -387,7 +466,7 @@ local function report(actionname)
     for a, l in pairs(by_action) do order[#order + 1] = {a = a, n = #l} end
     table.sort(order, function(x, y) return x.n > y.n end)
     for i = 1, math.min(#order, 5) do
-        say('== ' .. order[i].a .. ' (n=' .. order[i].n .. ')')
+        say('== ' .. disp(order[i].a) .. ' (n=' .. order[i].n .. ')')
         local by_set = stats.group(by_action[order[i].a], current_name)
         local names = {}
         for nm in pairs(by_set) do names[#names + 1] = nm end
@@ -401,22 +480,378 @@ local function report(actionname)
     end
 end
 
-local function compare(a, b, actionname)
+-- everything compare needs, for the chat lines and for the HUD; returns nil, message when it cannot be worked out
+local function compare_data(a, b, actionname)
     local list = matching(actionname)
     local by_set = stats.group(list, current_name)
     local la, lb = by_set[a], by_set[b]
-    if not la or not lb then say('need rows for both sets: ' .. a .. ' / ' .. b); return end
+    if not la or not lb then
+        local missing, known = {}, {}
+        if not la then missing[#missing + 1] = a end
+        if not lb then missing[#missing + 1] = b end
+        for nm in pairs(by_set) do known[#known + 1] = nm end
+        table.sort(known)
+        local shown = {}
+        for i = 1, math.min(#known, 8) do shown[#shown + 1] = known[i] end
+        local names = #shown > 0 and (table.concat(shown, ', ') .. (#known > 8 and ', ...' or '')) or nil
+        return nil,
+            'no rows for set: ' .. table.concat(missing, ', ') .. '. Sets with rows: ' .. (names or '(none under the current filters)')
+                .. '. Type the set names as they are, without < >  (//setab sets)',
+            'セットの記録がありません: ' .. table.concat(missing, ', ') .. '。記録があるセット: ' .. (names or '（今の絞り込みでは、ありません）')
+                .. '。< > は付けずに、名前をそのまま入力してください（//setab sets）'
+    end
     local sa, sb = summarize(la), summarize(lb)
-    if not sa.mean or not sb.mean then say('no hit rows for one of the sets.'); return end
+    if not sa.mean or not sb.mean then return nil, 'no hit rows for one of the sets.', 'どちらかのセットに、ダメージの記録がありません。' end
     local diff = sa.mean - sb.mean
     local pct = sb.mean ~= 0 and (100 * diff / sb.mean) or 0
     local t = stats.welch(sa.dm, sb.dm)
-    say(string.format('%s: n=%d avg=%s | %s: n=%d avg=%s', a, sa.n, f0(sa.mean), b, sb.n, f0(sb.mean)))
-    local verdict
-    if not t then verdict = 'not enough data (need 2+ hits per set)'
-    elseif math.abs(t) >= 2 then verdict = 'likely a real difference (|t|>=2)'
-    else verdict = 'no clear difference yet (|t|<2); collect more samples' end
-    say(string.format('diff %+.0f (%+.1f%%) t=%s -> %s', diff, pct, t and string.format('%.2f', t) or '-', verdict))
+    local verdict, level
+    if not t then verdict, level = 'not enough data (need 2+ hits per set)', 'none'
+    elseif math.abs(t) >= 2 then verdict, level = 'likely a real difference (|t|>=2)', 'yes'
+    else verdict, level = 'no clear difference yet (|t|<2); collect more samples', 'no' end
+    -- how many different actions are mixed in these rows (only matters when no action name was given)
+    local seen, kinds = {}, 0
+    for _, l in ipairs({la, lb}) do
+        for _, r in ipairs(l) do
+            if not seen[r.action] then seen[r.action] = true; kinds = kinds + 1 end
+        end
+    end
+    return {a = a, b = b, sa = sa, sb = sb, diff = diff, pct = pct, t = t, verdict = verdict, level = level,
+            action = actionname, kinds = kinds}
+end
+
+local function compare(a, b, actionname)
+    local d, err = compare_data(a, b, actionname)
+    if not d then say(err); return end
+    say(string.format('%s: n=%d avg=%s | %s: n=%d avg=%s', a, d.sa.n, f0(d.sa.mean), b, d.sb.n, f0(d.sb.mean)))
+    say(string.format('diff %+.0f (%+.1f%%) t=%s -> %s', d.diff, d.pct, d.t and string.format('%.2f', d.t) or '-', d.verdict))
+    if not actionname and d.kinds > 1 then
+        say(string.format('note: %d different actions are mixed here. Add an action name to compare one of them (list: //setab actions)', d.kinds))
+    end
+end
+
+---------------------------------------------------------------- HUD (//setab compare shows a table: A on top, B below)
+local hud = texts.new('', settings)
+hud:hide()
+local hud_last = 0
+
+local function color(r, g, b, s) return string.format('\\cs(%d,%d,%d)%s\\cr', r, g, b, s) end
+
+-- display-width helpers: set names may be Japanese (3 UTF-8 bytes = a wide character), so cut and pad by character
+local function fit(s, w, right)
+    local out, used = {}, 0
+    for c in string.gmatch(tostring(s), '[%z\1-\127\194-\244][\128-\191]*') do
+        local x = #c >= 3 and 2 or 1
+        if used + x > w then break end
+        out[#out + 1] = c; used = used + x
+    end
+    local fill = string.rep(' ', w - used)
+    if right then return fill .. table.concat(out) end
+    return table.concat(out) .. fill
+end
+
+local function last_values(dm, limit)
+    local n = #dm
+    local from = math.max(1, n - limit + 1)
+    local out = {}
+    for i = from, n do out[#out + 1] = string.format('%.0f', dm[i]) end
+    return (from > 1 and '.. ' or '') .. table.concat(out, ' ')
+end
+
+-- HUD wording: Japanese when the client (or //setab lang ja) is Japanese; the chat lines stay English
+local function T(ja, en) return use_ja() and ja or en end
+
+-- width in screen cells: a Japanese character (3 UTF-8 bytes) is 2 cells wide in MS Gothic, ASCII is 1
+local function cells(s)
+    local n = 0
+    for c in string.gmatch(tostring(s), '[%z\1-\127\194-\244][\128-\191]*') do n = n + (#c >= 3 and 2 or 1) end
+    return n
+end
+
+-- One HUD line built from segments {text, key, rgb}. key = what the mouse tooltip explains over that part of the line.
+-- The cell range of every key is recorded in layout, so a pointer position can be turned back into a key (see key_at).
+local function build_line(layout, segs, line_rgb)
+    local out, marks, c = {}, {}, 0
+    for _, sg in ipairs(segs) do
+        local w = cells(sg[1])
+        if sg[2] then marks[#marks + 1] = {c, c + w, sg[2]} end
+        out[#out + 1] = sg[3] and color(sg[3][1], sg[3][2], sg[3][3], sg[1]) or sg[1]
+        c = c + w
+    end
+    layout.lines[#layout.lines + 1] = marks
+    if c > layout.max then layout.max = c end
+    local s = table.concat(out)
+    if line_rgb then return color(line_rgb[1], line_rgb[2], line_rgb[3], s) end
+    return s
+end
+
+-- the columns of one set's row (A or B); label + name = the set, the rest are the statistics
+local function hud_cols(label, name, s, key)
+    local missp = s.n > 0 and (100 * s.miss / s.n) or 0
+    return {
+        {label .. '  ', key}, {fit(name, 14), key}, {' '},
+        {fit(s.n, 4, true), 'n'}, {' '}, {fit(f0(s.mean), 7, true), 'avg'}, {' '}, {fit(f0(s.med), 7, true), 'med'}, {' '},
+        {fit(f0(s.min), 7, true), 'min'}, {' '}, {fit(f0(s.max), 7, true), 'max'}, {' '},
+        {fit(s.ci and ('+-' .. f0(s.ci)) or '+-?', 8, true), 'ci'}, {' '},
+        {fit(string.format('%.0f%%', missp), 5, true), 'miss'},
+    }
+end
+
+-- returns the HUD text and its layout (see build_line)
+local function hud_text(d)
+    local layout = {lines = {}, max = 0}
+    local lines = {}
+    local function add(segs, rgb) lines[#lines + 1] = build_line(layout, segs, rgb) end
+    local filters = {}
+    if filt.target then filters[#filters + 1] = T('敵=', 'target=') .. filt.target end
+    if filt.tpmin or filt.tpmax then filters[#filters + 1] = 'TP=' .. tostring(filt.tpmin or '') .. '-' .. tostring(filt.tpmax or '') end
+    local title = d.action or T('全ての技', 'all actions')
+    if not d.action and d.kinds > 1 then
+        title = title .. T(' (' .. d.kinds .. ' 種類が混ざっています。技名を付けてください)',
+                           ' (' .. d.kinds .. ' kinds mixed: add an action name)')
+    end
+    add({{'SetAB  ' .. title, 'title', {255, 220, 120}},
+         {#filters > 0 and ('   [' .. table.concat(filters, ' ') .. ']') or '', 'filter'}})
+    add({{string.rep('-', 68)}})
+    add({{'   '}, {fit(T('セット', 'set'), 14), 'set'}, {' '}, {fit(T('回数', 'n'), 4, true), 'n'}, {' '},
+         {fit(T('平均', 'avg'), 7, true), 'avg'}, {' '}, {fit(T('中央値', 'med'), 7, true), 'med'}, {' '},
+         {fit(T('最小', 'min'), 7, true), 'min'}, {' '}, {fit(T('最大', 'max'), 7, true), 'max'}, {' '},
+         {fit(T('信頼幅', '+-ci'), 8, true), 'ci'}, {' '}, {fit(T('ミス', 'miss'), 5, true), 'miss'}})
+    local dmglabel = T('ダメージ ', 'dmg ')
+    add(hud_cols('A', d.a, d.sa, 'a'), {140, 200, 255})
+    add({{'     ' .. dmglabel .. last_values(d.sa.dm, 10), 'dmg'}})
+    add(hud_cols('B', d.b, d.sb, 'b'), {255, 180, 140})
+    add({{'     ' .. dmglabel .. last_values(d.sb.dm, 10), 'dmg'}})
+    add({{string.rep('-', 68)}})
+    local rgb = {yes = {120, 255, 120}, no = {200, 200, 200}, none = {255, 180, 80}}
+    local c = rgb[d.level] or rgb.no
+    local tv = d.t and string.format('%.2f', d.t) or '-'
+    add({{T(string.format('A と B の差   %+.0f（B を基準に %+.1f%%）', d.diff, d.pct),
+            string.format('A vs B   diff %+.0f (%+.1f%% of B)', d.diff, d.pct)), 'diff'},
+         {'   '}, {'t=' .. tv, 't'}}, c)
+    local verdicts = {
+        yes = T('差がありそうです（|t| が 2 以上）', 'likely a real difference (|t|>=2)'),
+        no = T('差があるとは言えません（|t| が 2 より小さい）。記録を増やしてください', 'no clear difference yet (|t|<2); collect more samples'),
+        none = T('データが足りません（各セットに、ダメージが 2 回以上必要）', 'not enough data (need 2+ hits per set)'),
+    }
+    add({{verdicts[d.level] or d.verdict, 'verdict'}}, c)
+    return table.concat(lines, string.char(10)), layout
+end
+
+---------------------------------------------------------------- mouse tooltip (a second small HUD)
+-- What each part of the table means. Shown beside the pointer while it is over that part of the HUD.
+local function tip_content(key)
+    local t = {
+        title = {T('技名と絞り込み', 'Action and filters'),
+                 T('比べている技の名前です。[ ] の中は、今の絞り込み（敵の名前・TP の範囲）です。//setab target・//setab tp・//setab filter clear で変えられます。',
+                   'The action being compared. In [ ] are the current filters (enemy name, TP range). Change them with //setab target, //setab tp, //setab filter clear.')},
+        filter = {T('絞り込み', 'Filters'),
+                  T('今の絞り込み（敵の名前・TP の範囲）です。この条件に合う記録だけを、表にしています。//setab filter clear で外せます。',
+                    'The current filters (enemy name, TP range). Only the records that match are in the table. //setab filter clear removes them.')},
+        set = {T('セット', 'Set'),
+               T('装備のセットの名前です。A は compare の 1 つ目、B は 2 つ目に指定したセットです。',
+                 'The name of the gear set. A is the first set given to compare, B is the second.')},
+        a = {T('A（1 つ目のセット）', 'A (the first set)'),
+             T('compare の 1 つ目に指定したセットです。差は「A − B」で計算します。', 'The first set given to compare. The difference is worked out as A - B.')},
+        b = {T('B（2 つ目のセット）', 'B (the second set)'),
+             T('compare の 2 つ目に指定したセットです。割合は、B の平均を基準にしています。', 'The second set given to compare. The percentage is taken against the average of B.')},
+        n = {T('回数（n）', 'n (count)'),
+             T('記録された回数です（ミスやレジストも 1 回に数えます）。多いほど、結果が安定します。',
+               'How many records there are (a miss or a resist counts as one too). The more, the steadier the result.')},
+        avg = {T('平均', 'avg (average)'),
+               T('ダメージの平均値です（ミスやレジストは含みません）。', 'The average damage (misses and resists are not counted).')},
+        med = {T('中央値', 'med (median)'),
+               T('ダメージを小さい順に並べたときの、真ん中の値です。極端に大きい・小さい値の影響を受けにくいので、平均と離れているときは、ばらつきが大きいサインです。',
+                 'The middle value when the damage is sorted. It is hardly moved by extreme values, so when it is far from the average, the damage varies a lot.')},
+        min = {T('最小', 'min'), T('いちばん小さかったダメージです。', 'The smallest damage.')},
+        max = {T('最大', 'max'), T('いちばん大きかったダメージです。', 'The largest damage.')},
+        ci = {T('信頼幅（+-）', '+-ci (confidence)'),
+              T('平均の「±」に当たる値で、95% 信頼区間の半分の幅です。「本当の平均は、平均 ± この値の中にありそう」という目安です。回数が少ない・ばらつきが大きいほど、大きくなります。',
+                'The "plus or minus" of the average: half the width of the 95% confidence interval. The real average is probably within the average +- this value. It grows when there are few records or the damage varies a lot.')},
+        miss = {T('ミス', 'miss'),
+                T('ミス（弱体魔法ではレジスト）の割合です。記録の回数のうち、ダメージが出なかった割合です。',
+                  'The share of records that missed (resisted, for enfeebling spells): the ones where no damage was dealt.')},
+        dmg = {T('撃った順のダメージ', 'Damage, in order'),
+               T('直近 10 回のダメージを、撃った順に並べています（「..」は、それより前にも記録があるという意味）。値がいくつかの段に分かれていないか、見てください。分かれているときは、敵の状態や天候など、条件が混ざっています。',
+                 'The last 10 damage values in the order they happened (".." means there are earlier ones). Check whether they fall into a few separate levels: if so, conditions such as the enemy state or the weather are mixed.')},
+        diff = {T('A と B の差', 'Difference of A and B'),
+                T('A の平均から B の平均を引いた値です。かっこの中は、B の平均を基準にした割合で、「A は B より何 % 高いか」を表します（マイナスなら低い）。',
+                  'The average of A minus the average of B. In brackets is the percentage against B: how much higher A is than B (a minus means lower).')},
+        t = {T('t 値（Welch の t 値）', 't (Welch t value)'),
+             T('差が、偶然のばらつきなのかを見る目安です。|t|（t の絶対値）が 2 以上なら、偶然とは考えにくく、差がありそうです。2 より小さいときは、まだ差があるとは言えません。回数が少ない、またはダメージのばらつきが大きいと、t は 0 に近くなります。',
+               'A guide to whether the difference could be chance. If |t| (t without the sign) is 2 or more, chance is unlikely and the difference is probably real. Below 2, you cannot say there is a difference yet. With few records or widely varying damage, t stays near 0.')},
+        verdict = {T('判定', 'Verdict'),
+                   T('|t| が 2 以上なら「差がありそう」、2 より小さいなら「差があるとは言えない」です。「データが足りません」は、どちらかのセットに、ダメージの記録が 2 回未満のときです。',
+                     '"Likely a real difference" when |t| is 2 or more, "no clear difference" when it is below 2. "Not enough data" means one of the sets has fewer than 2 damage records.')},
+    }
+    local v = t[key]
+    if v then return v[1], v[2] end
+end
+
+-- Wrap the tooltip text at max cells. Where a line may break:
+--   Japanese: between any two characters, except right after an ASCII word or number ("2|以上", "t|の": the ASCII part
+--             moves to the next line together with what follows it), before closing punctuation (。 、 ）) and after an
+--             opening bracket (（ 「).
+--   English:  only at a space between words (a word is never cut unless it is longer than a line).
+local NO_LINE_START = {['。'] = true, ['、'] = true, ['）'] = true, ['」'] = true, ['，'] = true, ['．'] = true, ['！'] = true, ['？'] = true}
+local NO_LINE_END = {['（'] = true, ['「'] = true, ['『'] = true}
+
+local function break_ok(buf, n, c)   -- may a line break between buf[n] and the next character c?
+    if c == ' ' or NO_LINE_START[c] or NO_LINE_END[buf[n]] then return false end
+    local p = buf[n]
+    if #c >= 3 then
+        -- c is Japanese: not right after an ASCII word / number (spaces between them do not help)
+        local j = n
+        while j > 1 and buf[j] == ' ' do j = j - 1 end
+        local last = buf[j]
+        return last == nil or #last >= 3
+    end
+    -- c is ASCII: only after a space (between words) or after Japanese
+    return p == ' ' or #p >= 3
+end
+
+local function wrap(s, max)
+    local out, buf, bw, brk = {}, {}, 0, nil
+    local function flush_at(n)   -- close the line after buf[n]; the rest carries over
+        local line, carry = {}, {}
+        for i = 1, n do line[#line + 1] = buf[i] end
+        for i = n + 1, #buf do carry[#carry + 1] = buf[i] end
+        out[#out + 1] = (table.concat(line):gsub(' +$', ''))
+        buf, bw, brk = carry, 0, nil
+        for i, x in ipairs(buf) do
+            bw = bw + (#x >= 3 and 2 or 1)
+            if i < #buf and break_ok(buf, i, buf[i + 1]) then brk = i end
+        end
+    end
+    for c in string.gmatch(s, '[%z\1-\127\194-\244][\128-\191]*') do
+        local w = #c >= 3 and 2 or 1
+        if #buf > 0 and break_ok(buf, #buf, c) then brk = #buf end
+        if bw + w > max and #buf > 0 then
+            if brk and brk > 0 then flush_at(brk) else flush_at(#buf) end
+            if #buf > 0 and break_ok(buf, #buf, c) then brk = #buf end
+        end
+        buf[#buf + 1] = c; bw = bw + w
+    end
+    if #buf > 0 then out[#out + 1] = (table.concat(buf):gsub(' +$', '')) end
+    return out
+end
+
+local tip = texts.new('', {
+    pos = {x = 0, y = 0},
+    text = {font = settings.text.font, size = settings.text.size, alpha = 255},
+    bg = {alpha = 235, red = 20, green = 20, blue = 45, visible = true},
+    flags = {draggable = false},
+    padding = 6,
+})
+tip:hide()
+local TIP_COLS = 50   -- wrap width, in cells
+local tip_key, tip_suppress, tip_w, tip_h = nil, false, 0, 0
+local hud_layout = nil   -- where each key sits in the HUD text (set by hud_refresh)
+
+local function tip_hide()
+    tip_key = nil
+    if tip:visible() then tip:hide() end
+end
+
+local function hud_hide()
+    hud:hide()
+    tip_hide()
+end
+
+-- the key under the pointer, from its position: the HUD box is made of the text lines and the text cells (all lines have the
+-- same height, every cell the same width in a fixed-width font), inside the padding. hud:extents() is the whole box.
+local function key_at(x, y)
+    if not hud_layout or #hud_layout.lines == 0 or hud_layout.max <= 0 then return nil end
+    local px, py = hud:pos()
+    local w, h = hud:extents()
+    if not (px and py and w and h) or w <= 0 or h <= 0 then return nil end
+    local pad = settings.padding or 6
+    local line_h = (h - 2 * pad) / #hud_layout.lines
+    local cell_w = (w - 2 * pad) / hud_layout.max
+    if line_h <= 0 or cell_w <= 0 then return nil end
+    local marks = hud_layout.lines[math.floor((y - py - pad) / line_h) + 1]
+    if not marks then return nil end
+    local col = math.floor((x - px - pad) / cell_w)
+    for _, m in ipairs(marks) do
+        if col >= m[1] and col < m[2] then return m[3], cell_w, line_h end
+    end
+    return nil
+end
+
+local function tip_update(x, y)
+    if not settings.hud_tip or tip_suppress or not hud:visible() or not hud:hover(x, y) then tip_hide(); return end
+    local key, cell_w, line_h = key_at(x, y)
+    local title, body = tip_content(key)
+    if not title then tip_hide(); return end
+    if key ~= tip_key then
+        tip_key = key
+        if debug_on then
+            local px, py = hud:pos()
+            local w, h = hud:extents()
+            dbg(string.format('tip key=%s pointer=%d,%d hud=%s,%s box=%s x %s lines=%d cells=%d', tostring(key), x, y,
+                tostring(px), tostring(py), tostring(w), tostring(h), #hud_layout.lines, hud_layout.max))
+        end
+        local lines = wrap(body, TIP_COLS)
+        local maxc = cells(title)
+        for _, l in ipairs(lines) do maxc = math.max(maxc, cells(l)) end
+        tip:text(color(255, 220, 120, title) .. string.char(10) .. table.concat(lines, string.char(10)))
+        tip_w, tip_h = maxc, #lines + 1
+    end
+    -- beside the pointer; on the other side near the screen edge
+    local ok, info = pcall(windower.get_windower_settings)
+    local sw = ok and info and info.ui_x_res or 1920
+    local sh = ok and info and info.ui_y_res or 1080
+    local bw = tip_w * (cell_w or 7) + 12
+    local bh = tip_h * (line_h or 14) + 12
+    local tx, ty = x + 16, y + 22
+    if tx + bw > sw then tx = x - bw - 8 end
+    if ty + bh > sh then ty = y - bh - 8 end
+    tip:pos(math.max(0, tx), math.max(0, ty))
+    tip:show()
+end
+
+local function hud_refresh()
+    if not hud_state then return end
+    hud_dirty = false
+    local d, err, err_ja = compare_data(hud_state.a, hud_state.b, hud_state.action)
+    if d then
+        local text, layout = hud_text(d)
+        hud_layout = layout
+        hud:text(text)
+    else
+        hud_layout = nil
+        hud:text(color(255, 180, 80, 'SetAB: ' .. T(err_ja, err)))
+    end
+end
+
+local function hud_set_size(size)
+    size = math.max(HUD_SIZE_MIN, math.min(HUD_SIZE_MAX, math.floor(size + 0.5)))
+    settings.text.size = size
+    hud:size(size)
+    tip:size(size)
+    tip_hide()
+    config.save(settings)
+    return size
+end
+
+-- the action names to type after report / compare: exactly as recorded (WS, spell and pet ability names in English)
+local function list_actions(setname)
+    local counts, order = {}, {}
+    for _, r in ipairs(matching(nil)) do
+        if not setname or string.lower(current_name(r)) == string.lower(setname) then
+            if not counts[r.action] then counts[r.action] = 0; order[#order + 1] = r.action end
+            counts[r.action] = counts[r.action] + 1
+        end
+    end
+    if #order == 0 then say('no recorded actions' .. (setname and (' for set ' .. setname) or '') .. '.'); return end
+    table.sort(order, function(x, y) if counts[x] ~= counts[y] then return counts[x] > counts[y] end return x < y end)
+    say('recorded actions (type the name after report / compare; English or Japanese, a part of the name is enough):')
+    for i = 1, math.min(#order, 20) do
+        local shown = disp(order[i])
+        local label = shown == order[i] and shown or (shown .. ' (' .. order[i] .. ')')
+        say(string.format('  %s  n=%d', label, counts[order[i]]))
+    end
+    if #order > 20 then say(string.format('  ... and %d more', #order - 20)) end
 end
 
 local function list_sets()
@@ -433,8 +868,13 @@ local function help()
     say('//setab label <name>      name the currently equipped set')
     say('//setab name <hash> <name> rename a set by hash (see //setab sets)')
     say('//setab sets              list known sets')
-    say('//setab report [action]   per-set stats')
-    say('//setab compare <A> <B> [action]')
+    say('//setab actions [set]     list the recorded action names (WS / spell / pet ability)')
+    say('//setab report [action]   per-set stats. action = a name from //setab actions (English or Japanese; Tab works); none = all')
+    say('//setab compare A B [action]  chat lines + the HUD table (A on top, B below). Do not type the < >')
+    say('   e.g. //setab compare Nyame ABMagic Aeolian Edge   (set names: //setab sets)')
+    say('//setab lang ja|en|auto   language of the action names shown (auto = the client)')
+    say('//setab hud [on|off|size <n>|reset|tip on|off]  show / hide the table; on|off = open it on compare or not; tip = the pointer tooltips')
+    say('   drag the table with the mouse to move it; wheel over it to resize; the pointer over a heading (t, avg ...) explains it')
     say('//setab tp <min> [max] | target <text> | filter clear')
     say('//setab ignore <slot>     toggle a slot out of the set hash (e.g. ammo)')
     say('//setab reset confirm     erase the log')
@@ -443,6 +883,7 @@ end
 
 local function on_command(cmd, ...)
     local args = {...}
+    for i = 1, #args do args[i] = from_sjis(args[i]) end   -- Japanese typed or Tab-converted arrives as Shift-JIS
     cmd = cmd and string.lower(cmd) or 'help'
     if cmd == 'on' or cmd == 'off' then
         settings.enabled = (cmd == 'on'); config.save(settings)
@@ -463,18 +904,57 @@ local function on_command(cmd, ...)
         if not hash or not sets[hash] or nm == '' then say('usage: //setab name <hash> <name>'); return end
         sets[hash].name = clean(nm); save_sets(); say('renamed.')
     elseif cmd == 'sets' then list_sets()
+    elseif cmd == 'actions' then list_actions(table.concat(args, ' ') ~= '' and table.concat(args, ' ') or nil)
     elseif cmd == 'report' then report(table.concat(args, ' ') ~= '' and table.concat(args, ' ') or nil)
     elseif cmd == 'compare' then
         if #args < 2 then say('usage: //setab compare <A> <B> [action]'); return end
-        compare(args[1], args[2], args[3] and table.concat(args, ' ', 3) or nil)
+        local action = args[3] and table.concat(args, ' ', 3) or nil
+        compare(args[1], args[2], action)
+        hud_state = {a = args[1], b = args[2], action = action}
+        hud_refresh()
+        if settings.hud_on then hud:show() end
+    elseif cmd == 'lang' then
+        local a = args[1] and string.lower(args[1])
+        if a == 'ja' or a == 'en' or a == 'auto' then
+            settings.lang = a; config.save(settings)
+            hud_dirty = hud_state ~= nil
+            tip_hide()   -- the tooltip text is in the old language
+        end
+        say('action names shown in: ' .. tostring(settings.lang) .. ' (' .. (use_ja() and 'Japanese' or 'English') .. ').  //setab lang ja|en|auto')
+    elseif cmd == 'hud' then
+        local a = args[1] and string.lower(args[1])
+        if a == 'on' or a == 'off' then
+            settings.hud_on = (a == 'on'); config.save(settings)
+            if a == 'off' then hud_hide() end
+            say('hud ' .. a .. (a == 'on' and ' (the table opens on //setab compare)' or ' (hidden; //setab hud shows it again)'))
+        elseif a == 'tip' then
+            local b = args[2] and string.lower(args[2])
+            if b == 'on' or b == 'off' then settings.hud_tip = (b == 'on'); config.save(settings); if b == 'off' then tip_hide() end end
+            say('hud tooltip ' .. (settings.hud_tip and 'on' or 'off') .. '  (//setab hud tip on|off)')
+        elseif a == 'size' then
+            local n = tonumber(args[2])
+            if not n then say('usage: //setab hud size <' .. HUD_SIZE_MIN .. '-' .. HUD_SIZE_MAX .. '>'); return end
+            say('hud size ' .. hud_set_size(n))
+        elseif a == 'reset' then
+            settings.pos.x, settings.pos.y = defaults.pos.x, defaults.pos.y
+            hud:pos(settings.pos.x, settings.pos.y)
+            hud_set_size(defaults.text.size)
+            say('hud position and size reset.')
+        else
+            if not hud_state then say('nothing to show yet: run //setab compare <A> <B> [action]'); return end
+            if hud:visible() then hud_hide() else hud_refresh(); hud:show() end
+        end
     elseif cmd == 'tp' then
         filt.tpmin, filt.tpmax = tonumber(args[1]), tonumber(args[2])
         say('tp filter: ' .. tostring(filt.tpmin) .. ' - ' .. tostring(filt.tpmax))
+        hud_dirty = hud_state ~= nil
     elseif cmd == 'target' then
         filt.target = (#args > 0) and table.concat(args, ' ') or nil
         say('target filter: ' .. tostring(filt.target))
+        hud_dirty = hud_state ~= nil
     elseif cmd == 'filter' and args[1] == 'clear' then
         filt = {}; say('filters cleared.')
+        hud_dirty = hud_state ~= nil
     elseif cmd == 'ignore' then
         local slot = args[1]
         if not slot then say('usage: //setab ignore <slot>'); return end
@@ -512,8 +992,8 @@ windower.register_event('load', function()
     if windower.ffxi.get_info().logged_in then init() end
 end)
 windower.register_event('login', function() coroutine.schedule(init, 5) end)
-windower.register_event('logout', function() flush(); me_id = nil end)
-windower.register_event('unload', flush)
+windower.register_event('logout', function() flush(); me_id = nil; hud_hide() end)
+windower.register_event('unload', function() flush(); hud:destroy(); tip:destroy() end)
 windower.register_event('action', on_action)
 windower.register_event('tp change', function(new_tp, old_tp)
     tp_prev, tp_prev_t = old_tp, os.clock()
@@ -522,4 +1002,31 @@ end)
 windower.register_event('addon command', on_command)
 windower.register_event('prerender', function()
     if #queue > 0 and os.clock() - last_flush > 10 then flush() end
+    if hud_dirty and hud:visible() and os.clock() - hud_last > 1 then
+        hud_last = os.clock()
+        hud_refresh()
+    end
+end)
+
+-- Mouse: dragging the table is done by libs/texts (and it saves the position); the wheel over the table resizes it;
+-- the pointer over a part of the table shows what that part means (a second small HUD).
+-- A move is never swallowed (returning true would stop libs/texts from dragging). Returning true on the wheel keeps it
+-- from reaching the game while the cursor is on the table.
+local MOUSE_MOVE, MOUSE_LEFT_DOWN, MOUSE_LEFT_UP, MOUSE_WHEEL = 0, 1, 2, 10
+windower.register_event('mouse', function(mtype, x, y, delta, blocked)
+    if mtype == MOUSE_MOVE then
+        if not blocked then tip_update(x, y) end
+        return
+    elseif mtype == MOUSE_LEFT_DOWN then
+        tip_suppress = true   -- no tooltip while the button is down (dragging the table)
+        tip_hide()
+        return
+    elseif mtype == MOUSE_LEFT_UP then
+        tip_suppress = false
+        return
+    end
+    if blocked or mtype ~= MOUSE_WHEEL then return end
+    if not hud:visible() or not hud:hover(x, y) then return end
+    hud_set_size((settings.text.size or 11) + ((delta or 0) > 0 and 1 or -1))
+    return true
 end)
