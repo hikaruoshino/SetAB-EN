@@ -6,7 +6,7 @@ Chat output is ASCII only (Japanese needs Shift-JIS conversion in the FFXI chat 
 
 _addon.name     = 'SetAB'
 _addon.author   = 'hikaruoshino'
-_addon.version  = '0.3.0'
+_addon.version  = '0.3.1'
 _addon.commands = {'setab', 'sab'}
 
 local res      = require('resources')
@@ -208,7 +208,7 @@ end
 local function flush()
     if #queue == 0 then return end
     local f = io.open(data_dir() .. 'log.csv', 'a')
-    if not f then return end
+    if not f then last_flush = os.clock(); return end   -- the file is locked (e.g. open in a spreadsheet): try again in 10 s, not every frame
     for _, l in ipairs(queue) do f:write(l, '\n') end
     f:close()
     queue = {}
@@ -342,7 +342,7 @@ local function on_action(act)
     else
         hash, desc = snapshot()
     end
-    pending_snap = nil
+    if kind == 'self' then pending_snap = nil end   -- a pet's result must not drop the WS start snapshot
     if not hash then return end
     local setname = name_for(hash, desc)
 
@@ -363,7 +363,7 @@ local function on_action(act)
             if tp_prev and os.clock() - tp_prev_t < 3 and tp_prev > tp then tp = tp_prev end
         end
     end
-    pending_tp = -1
+    if kind == 'self' then pending_tp = -1 end
     local aname = action_name(cat, act.param, todo[1].msg)
 
     for _, d in ipairs(todo) do
@@ -991,7 +991,11 @@ end
 windower.register_event('load', function()
     if windower.ffxi.get_info().logged_in then init() end
 end)
-windower.register_event('login', function() coroutine.schedule(init, 5) end)
+local function init_retry(left)
+    init()
+    if not me_id and left > 0 then coroutine.schedule(function() init_retry(left - 1) end, 5) end   -- the player may not be readable yet
+end
+windower.register_event('login', function() coroutine.schedule(function() init_retry(3) end, 5) end)
 windower.register_event('logout', function() flush(); me_id = nil; hud_hide() end)
 windower.register_event('unload', function() flush(); hud:destroy(); tip:destroy() end)
 windower.register_event('action', on_action)
