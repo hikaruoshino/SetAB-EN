@@ -46,6 +46,8 @@ A weapon skill set is worn **only at the moment you use it**, so you cannot labe
 
 `//setab compare A B [action]` opens a table on the screen. **A is the top row and B the row below**, with count, mean, median, min, max, half the width of the 95% confidence interval and the miss (resist) rate beside each. Under each row are the damage values in the order they happened (the last 10). At the bottom are the difference of A and B (as a percentage of B), the t value and a verdict on whether there is a difference.
 
+*The screenshots in this section were taken on a Japanese client, so the table and the explanations are in Japanese. On an English client they are in English, as in the text example just below (the headings, the verdict and the explanations). The numbers and the layout are the same.*
+
 ![The SetAB table (HUD)](images/hud.png)
 
 ```
