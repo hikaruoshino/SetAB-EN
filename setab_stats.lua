@@ -29,11 +29,25 @@ function M.sd(t)
     return math.sqrt(s / (n - 1))
 end
 
--- half width of the ~95% confidence interval of the mean (normal approx.)
+-- two-sided 95% critical value of Student's t for df = 1..30 (the normal 1.96 is too narrow when there are few records)
+local T975 = {12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228,
+              2.201, 2.179, 2.160, 2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086,
+              2.080, 2.074, 2.069, 2.064, 2.060, 2.056, 2.052, 2.048, 2.045, 2.042}
+
+-- critical value for a (possibly fractional) number of degrees of freedom: the table up to 30,
+-- then 1.96 + 2.4/df (within 0.003 of the exact value from df = 31 up)
+function M.tcrit(df)
+    if not df or df < 1 then return nil end
+    if df >= 30 then return 1.96 + 2.4 / df end
+    local i = math.floor(df)
+    return T975[i] + (T975[i + 1] - T975[i]) * (df - i)
+end
+
+-- half width of the 95% confidence interval of the mean (Student's t, n - 1 degrees of freedom)
 function M.ci95(t)
     local sd = M.sd(t)
     if not sd then return nil end
-    return 1.96 * sd / math.sqrt(#t)
+    return M.tcrit(#t - 1) * sd / math.sqrt(#t)
 end
 
 -- Welch t statistic for mean(a) - mean(b); nil if not computable
@@ -43,6 +57,15 @@ function M.welch(a, b)
     local denom = math.sqrt(va + vb)
     if denom == 0 then return nil end
     return (M.mean(a) - M.mean(b)) / denom
+end
+
+-- Welch-Satterthwaite degrees of freedom for the same two samples; nil if not computable
+function M.welch_df(a, b)
+    if #a < 2 or #b < 2 then return nil end
+    local va, vb = M.sd(a) ^ 2 / #a, M.sd(b) ^ 2 / #b
+    local d = va * va / (#a - 1) + vb * vb / (#b - 1)
+    if d == 0 then return nil end
+    return (va + vb) ^ 2 / d
 end
 
 -- split a CSV line on commas (no quoting; fields must not contain commas)

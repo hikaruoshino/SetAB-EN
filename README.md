@@ -1,4 +1,4 @@
-# SetAB 0.3.1 (Windower 4 / Lua 5.1)
+# SetAB 0.3.2 (Windower 4 / Lua 5.1)
 
 [日本語 (Japanese)](https://github.com/hikaruoshino/SetAB)
 
@@ -16,7 +16,7 @@ It is **read-only**: it never sends a packet. It records only your own actions a
 1. Put on the gear you want to compare and name it, e.g. `//setab label Karin` (repeat this for each set you want to compare)
 2. Fight as usual (results are saved to `data/<your name>/log.csv`)
 3. `//setab report Hot Shot` (the action name: English, or Japanese on a Japanese client; part of the name is enough, and the Tab key (auto-translate) works. If you do not know what to type, list the names with `//setab actions`. Without a name, all actions are put together)
-4. `//setab compare Karin Fotia Hot Shot` (names without spaces are easier to handle). The result goes to the chat, and a table (HUD) opens on the screen
+4. `//setab compare Karin Fotia Hot Shot` (spaces in a set name are saved as `_`: a set labeled `Karin Obi` is typed as `Karin_Obi`). The result goes to the chat, and a table (HUD) opens on the screen
 
 A weapon skill set is worn **only at the moment you use it**, so you cannot label it beforehand. Use the weapon skill once, look up the hash with `//setab sets`, and name it with `//setab name <hash> <name>`.
 
@@ -54,13 +54,13 @@ A weapon skill set is worn **only at the moment you use it**, so you cannot labe
 SetAB  Aeolian Edge   [target=Locus Blazer Elytra TP=3000-3000]
 --------------------------------------------------------------------
    set               n     avg     med     min     max     +-ci  miss
-A  Nyame             3   36152   38734   30987   38734   +-5061    0%
+A  Nyame             3   36152   38734   30987   38734  +-11112    0%
      dmg 38734 30987 38734
-B  ABMagic           3   32344   34416   27532   35084   +-4731    0%
+B  ABMagic           3   32344   34416   27532   35084  +-10386    0%
      dmg 35084 34416 27532
 --------------------------------------------------------------------
 A vs B   diff +3808 (+11.8% of B)   t=1.08
-no clear difference yet (|t|<2); collect more samples
+no clear difference yet (|t|<2.78); collect more samples
 ```
 
 - **Move it with the mouse.** Drag the table to change its position (the position is saved).
@@ -85,12 +85,13 @@ One line of `log.csv` is one action's result on one enemy (an area attack adds o
 - A multi-hit weapon skill or pet ability is recorded as one line with the total of all hits (`hits` is the number that landed).
 - Spells are recorded only when the message is a damage message (buffs, haste and so on are not recorded). A pet's buff (ward) blood pact is not recorded either.
 - `tp` is the TP **just before** the weapon skill.
-- `set` / `hash` is the gear **at the start** of the action. Even if the swap back to your idle gear arrives before the result, it is not mixed up with the weapon skill gear.
+- `set` / `hash` is the gear **at the start for a weapon skill**, and **when the result arrives for a spell or a pet ability**. For a weapon skill, the swap back to your idle gear is not mixed up with the weapon skill gear even if it arrives before the result. Spells are read at the result rather than at the start (the precast set) because that is when you wear the midcast set that affects the damage. Whether a spell is ever recorded with the gear you swap back to, when GearSwap swaps right after the result, has not been checked in game.
 - The set is judged by item IDs and augments (earrings and rings included). Changing ammo makes a different set; use `//setab ignore ammo` to leave it out.
 
 ## Tips for comparing
 
-- Damage varies a lot. Do not conclude from a few samples (`compare` treats |t| < 2 as no difference).
+- Damage varies a lot. Do not conclude from a few samples. `compare` treats a |t| below a threshold as no difference, and the threshold is larger when there are fewer records: about 2.8 with 3 per set, about 2.1 with 10, about 2.0 with many. It is larger still when the two sets vary very differently (up to 4.3 with 3 per set). The confidence width also gets wider with fewer records.
+- **The mean and t use only the records that did damage. Misses and resists are not in the mean** (they are shown separately as the `miss` rate). When the two sets hit at different rates, look at the `miss` rate as well as the mean.
 - **Compare on the same enemy at the same TP.** The enemy's magic defense and resistances change the numbers a lot, even with the same gear. Narrow down with `//setab target` and `//setab tp`. A TP 3000 weapon skill gives nearly fixed damage steps, which makes it easy to compare.
 - Debuffs on the enemy (Geo-Malaise and so on) are not recorded. Keep track of when they were on. The weather and day go into the `weather` and `day` columns.
 
@@ -100,11 +101,18 @@ One line of `log.csv` is one action's result on one enemy (an area attack adds o
 - **Checked in game** (Japanese client, October 2026): weapon skills (single and multi-hit) and TP, black magic and magic bursts, that buffs and trusts are not recorded, the names and damage of pet abilities (beastmaster and summoner), that a pet's buff blood pacts are not recorded, enfeebling spells landing and resisting on enemies, a weapon skill missing, that earrings and rings count in the set, and the gear and TP at the start of a weapon skill.
 - **Checked in game for the table (HUD)** (0.3.0, Japanese client, October 2026): that the table opens (A on top, B below, the values beside them), the Japanese headings, an action name typed in Japanese with Tab (auto-translate), the list of actions with their Japanese names (no garbled text), moving the table by dragging, resizing it with the wheel, the explanations that appear over the headings, the t value, the difference and the verdict (and how they wrap), and `//setab hud tip off`, `//setab hud size` and `//setab hud reset`.
 - Misses and resists are judged by tables of message numbers (`MISS_MSG` = 188, 282; `RESIST_MSG` = 85, 284, 653-656). I have confirmed miss 188 and resist 85 and 653. The other numbers are not confirmed in game yet. A number that is not in a table is kept raw in the `msg` column, so you can sort them again later.
+- **Checked in game for 0.3.2** (scholar and summoner, Japanese client, October 2026): Aspir is not recorded (message 228); Drain is recorded as damage (message 227, matching the number on screen); black magic, magic bursts and enfeebles are recorded as before; `label` and `name` turn spaces into `_`; the `compare` threshold (2.41 with 5 and 6 records, 1.97 with many) and the table's Japanese text; the table keeps its position after a reload; a summoner's weapon skill keeps its TP and set even when an avatar's ability lands at almost the same moment. Not yet checked in game: the Absorb spells, and the "... and N more actions" line of `report`. A pet ability landing exactly between the start and the result of a weapon skill (the 0.3.1 fix) has not been reproduced in game either; it is covered only by simulated tests.
 - **Not checked on the English client yet.**
 - Using Windower is not permitted by the FFXI Terms of Service. I cannot guarantee that this addon is allowed or that it will not be detected. Use it at your own risk; the author accepts no responsibility.
 
 ## Changelog
 
+* **0.3.2**
+  * Fixed: actions that drain MP, TP or stats (Aspir, the Absorb spells and so on) were recorded as damage. Only HP drains (Drain and so on) count as damage now. Lines recorded before 0.3.2 stay in the log and still count in the mean; to get rid of them, erase the log with `//setab reset confirm`, or delete the lines of `log.csv` whose `msg` column is 228, 275, 329-335, 366, 454 and so on.
+  * With few records, the confidence width and the "likely a real difference" verdict were too generous. They now use the t distribution: the fewer the records, the wider the width and the higher the threshold (with many records, almost the same as before). The threshold is shown on the verdict line.
+  * `//setab label` and `//setab name` turn spaces in a name (full-width spaces too) into `_`, since a name with spaces was hard to type after `compare`. Names typed after `compare` and `actions` are converted the same way. Rename an older set whose name has spaces with `//setab name <hash> <name>`.
+  * `//setab report` now says when it left out actions after the fifth.
+  * The README now matches the code (when the gear is read; misses are not in the mean).
 * **0.3.1**
   * Fixed: for summoners, beastmasters and puppetmasters, a pet ability landing between the start and the result of your weapon skill could make the weapon skill be recorded with the gear and TP at the result instead of at the start.
   * When `log.csv` is open in another program and cannot be written, SetAB now retries every 10 seconds instead of every frame.

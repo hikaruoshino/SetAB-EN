@@ -6,7 +6,7 @@ Chat output is ASCII only (Japanese needs Shift-JIS conversion in the FFXI chat 
 
 _addon.name     = 'SetAB'
 _addon.author   = 'hikaruoshino'
-_addon.version  = '0.3.1'
+_addon.version  = '0.3.2'
 _addon.commands = {'setab', 'sab'}
 
 local res      = require('resources')
@@ -70,10 +70,11 @@ local FINISH_PET  = {[3] = true, [4] = true, [11] = true, [13] = true} -- pet TP
 local MISS_MSG   = {[188] = true, [282] = true}
 local RESIST_MSG = {[85] = true, [284] = true, [653] = true, [654] = true, [655] = true, [656] = true}
 -- Only damage messages count as damage, for every category (buffs carry a status id in param, not damage:
--- e.g. a Garuda ward recorded "33" = Haste before 0.2.2). Built from res: "... points of damage" or "... drained".
+-- e.g. a Garuda ward recorded "33" = Haste before 0.2.2). Built from res: "... points of damage" or "... HP drained"
+-- (MP / TP / stat drains such as Aspir or Absorb-STR are not HP damage: before 0.3.2 they were recorded as damage).
 local DMG_MSG = {}
 for id, m in pairs(res.action_messages or {}) do
-    if m.en and (string.find(m.en, 'points of damage', 1, true) or string.find(m.en, ' drained', 1, true)) then
+    if m.en and (string.find(m.en, 'points of damage', 1, true) or string.find(m.en, 'HP drained', 1, true)) then
         DMG_MSG[id] = true
     end
 end
@@ -117,6 +118,12 @@ local function say(msg) windower.add_to_chat(207, sjis('SetAB: ' .. msg)) end
 
 local function clean(s)
     return (tostring(s):gsub('[,\r\n\t]', ' '))
+end
+
+-- set names are typed as one word in //setab compare A B, so spaces (and the full-width space) become '_'
+local function set_name(s)
+    local t = clean(s):gsub('^%s+', ''):gsub('%s+$', '')
+    return (t:gsub('\227\128\128', '_'):gsub('%s+', '_'))
 end
 
 local function ignore_set()
@@ -478,6 +485,7 @@ local function report(actionname)
                 nm, s.n, f0(s.mean), f0(s.med), ci(s.ci), missp))
         end
     end
+    if #order > 5 then say(string.format('... and %d more actions (list: //setab actions)', #order - 5)) end
 end
 
 -- everything compare needs, for the chat lines and for the HUD; returns nil, message when it cannot be worked out
@@ -505,10 +513,15 @@ local function compare_data(a, b, actionname)
     local diff = sa.mean - sb.mean
     local pct = sb.mean ~= 0 and (100 * diff / sb.mean) or 0
     local t = stats.welch(sa.dm, sb.dm)
+    -- the |t| needed for "a real difference" depends on how many records there are (Welch degrees of freedom):
+    -- about 2.8 with 3 records per set, about 2.1 with 10, about 2.0 with 60 or more (when both sets vary about
+    -- as much; when one set varies far more, df falls and the value rises, up to 4.3 with 3 records per set)
+    local df = stats.welch_df(sa.dm, sb.dm)
+    local crit = df and stats.tcrit(df) or 2
     local verdict, level
     if not t then verdict, level = 'not enough data (need 2+ hits per set)', 'none'
-    elseif math.abs(t) >= 2 then verdict, level = 'likely a real difference (|t|>=2)', 'yes'
-    else verdict, level = 'no clear difference yet (|t|<2); collect more samples', 'no' end
+    elseif math.abs(t) >= crit then verdict, level = string.format('likely a real difference (|t|>=%.2f)', crit), 'yes'
+    else verdict, level = string.format('no clear difference yet (|t|<%.2f); collect more samples', crit), 'no' end
     -- how many different actions are mixed in these rows (only matters when no action name was given)
     local seen, kinds = {}, 0
     for _, l in ipairs({la, lb}) do
@@ -517,7 +530,7 @@ local function compare_data(a, b, actionname)
         end
     end
     return {a = a, b = b, sa = sa, sb = sb, diff = diff, pct = pct, t = t, verdict = verdict, level = level,
-            action = actionname, kinds = kinds}
+            action = actionname, kinds = kinds, crit = crit}
 end
 
 local function compare(a, b, actionname)
@@ -629,9 +642,10 @@ local function hud_text(d)
     add({{T(string.format('A と B の差   %+.0f（B を基準に %+.1f%%）', d.diff, d.pct),
             string.format('A vs B   diff %+.0f (%+.1f%% of B)', d.diff, d.pct)), 'diff'},
          {'   '}, {'t=' .. tv, 't'}}, c)
+    local cr = string.format('%.2f', d.crit or 2)
     local verdicts = {
-        yes = T('差がありそうです（|t| が 2 以上）', 'likely a real difference (|t|>=2)'),
-        no = T('差があるとは言えません（|t| が 2 より小さい）。記録を増やしてください', 'no clear difference yet (|t|<2); collect more samples'),
+        yes = T('差がありそうです（|t| が ' .. cr .. ' 以上）', 'likely a real difference (|t|>=' .. cr .. ')'),
+        no = T('差があるとは言えません（|t| が ' .. cr .. ' より小さい）。記録を増やしてください', 'no clear difference yet (|t|<' .. cr .. '); collect more samples'),
         none = T('データが足りません（各セットに、ダメージが 2 回以上必要）', 'not enough data (need 2+ hits per set)'),
     }
     add({{verdicts[d.level] or d.verdict, 'verdict'}}, c)
@@ -678,11 +692,11 @@ local function tip_content(key)
                 T('A の平均から B の平均を引いた値です。かっこの中は、B の平均を基準にした割合で、「A は B より何 % 高いか」を表します（マイナスなら低い）。',
                   'The average of A minus the average of B. In brackets is the percentage against B: how much higher A is than B (a minus means lower).')},
         t = {T('t 値（Welch の t 値）', 't (Welch t value)'),
-             T('差が、偶然のばらつきなのかを見る目安です。|t|（t の絶対値）が 2 以上なら、偶然とは考えにくく、差がありそうです。2 より小さいときは、まだ差があるとは言えません。回数が少ない、またはダメージのばらつきが大きいと、t は 0 に近くなります。',
-               'A guide to whether the difference could be chance. If |t| (t without the sign) is 2 or more, chance is unlikely and the difference is probably real. Below 2, you cannot say there is a difference yet. With few records or widely varying damage, t stays near 0.')},
+             T('差が、偶然のばらつきなのかを見る目安です。|t|（t の絶対値）が基準値以上なら、偶然とは考えにくく、差がありそうです。基準値は、回数が少ないほど大きく（3 回ずつで約 2.8、10 回ずつで約 2.1、多いと約 2.0。2 つのセットのばらつきが大きく違うと、もっと大きくなります）、判定の行に出ています。基準値より小さいときは、まだ差があるとは言えません。回数が少ない、またはダメージのばらつきが大きいと、t は 0 に近くなります。',
+               'A guide to whether the difference could be chance. If |t| (t without the sign) reaches the threshold, chance is unlikely and the difference is probably real. The threshold is larger when there are few records (about 2.8 with 3 per set, 2.1 with 10, 2.0 with many; higher still when the two sets vary very differently) and is shown on the verdict line. Below it, you cannot say there is a difference yet. With few records or widely varying damage, t stays near 0.')},
         verdict = {T('判定', 'Verdict'),
-                   T('|t| が 2 以上なら「差がありそう」、2 より小さいなら「差があるとは言えない」です。「データが足りません」は、どちらかのセットに、ダメージの記録が 2 回未満のときです。',
-                     '"Likely a real difference" when |t| is 2 or more, "no clear difference" when it is below 2. "Not enough data" means one of the sets has fewer than 2 damage records.')},
+                   T('|t| が基準値（回数が少ないほど大きい。行に出ている値）以上なら「差がありそう」、それより小さいなら「差があるとは言えない」です。「データが足りません」は、どちらかのセットに、ダメージの記録が 2 回未満のときです。',
+                     '"Likely a real difference" when |t| reaches the threshold (larger with few records; the value on the line), "no clear difference" when it is below. "Not enough data" means one of the sets has fewer than 2 damage records.')},
     }
     local v = t[key]
     if v then return v[1], v[2] end
@@ -893,24 +907,26 @@ local function on_command(cmd, ...)
             tostring(settings.enabled), #rows, (function() local c = 0 for _ in pairs(sets) do c = c + 1 end return c end)(),
             settings.ignore or ''))
     elseif cmd == 'label' then
-        local nm = table.concat(args, ' ')
+        local nm = set_name(table.concat(args, ' '))
         if nm == '' then say('usage: //setab label <name>'); return end
         local hash, desc = snapshot()
         if not hash then say('cannot read equipment.'); return end
-        sets[hash] = {name = clean(nm), desc = desc}
+        sets[hash] = {name = nm, desc = desc}
         save_sets(); say('labeled ' .. hash .. ' as ' .. nm)
     elseif cmd == 'name' then
-        local hash, nm = args[1], table.concat(args, ' ', 2)
+        local hash, nm = args[1], set_name(table.concat(args, ' ', 2))
         if not hash or not sets[hash] or nm == '' then say('usage: //setab name <hash> <name>'); return end
-        sets[hash].name = clean(nm); save_sets(); say('renamed.')
+        sets[hash].name = nm; save_sets(); say('renamed to ' .. nm)
     elseif cmd == 'sets' then list_sets()
-    elseif cmd == 'actions' then list_actions(table.concat(args, ' ') ~= '' and table.concat(args, ' ') or nil)
+    elseif cmd == 'actions' then list_actions(table.concat(args, ' ') ~= '' and set_name(table.concat(args, ' ')) or nil)
     elseif cmd == 'report' then report(table.concat(args, ' ') ~= '' and table.concat(args, ' ') or nil)
     elseif cmd == 'compare' then
         if #args < 2 then say('usage: //setab compare <A> <B> [action]'); return end
         local action = args[3] and table.concat(args, ' ', 3) or nil
-        compare(args[1], args[2], action)
-        hud_state = {a = args[1], b = args[2], action = action}
+        -- the same '_' rule as label / name, so a name typed with a full-width space still matches
+        local a, b = set_name(args[1]), set_name(args[2])
+        compare(a, b, action)
+        hud_state = {a = a, b = b, action = action}
         hud_refresh()
         if settings.hud_on then hud:show() end
     elseif cmd == 'lang' then
