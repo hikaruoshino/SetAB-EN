@@ -1,4 +1,4 @@
-# SetAB 0.3.2 (Windower 4 / Lua 5.1)
+# SetAB 0.3.3 (Windower 4 / Lua 5.1)
 
 [日本語 (Japanese)](https://github.com/hikaruoshino/SetAB)
 
@@ -79,9 +79,10 @@ no clear difference yet (|t|<2.78); collect more samples
 
 One line of `log.csv` is one action's result on one enemy (an area attack adds one line per enemy hit).
 
-`ts, zone, target, actor, action, cat, set, hash, tp, weather, day, buffs, result, dmg, msg, hits`
+`ts, zone, target, actor, action, cat, set, hash, tp, weather, day, buffs, result, dmg, msg, hits, act`
 
-- `result`: `hit` (damage) / `miss` / `resist` / `land` (an enfeebling spell that worked on an enemy)
+- `act` identifies one action. All targets of the same area attack share its ID. Old 16-column rows count individually. New 17-column rows can follow an old header, which leaves the last column unlabeled.
+- `result`: `hit` (including zero damage) / `miss` / `resist` / `absorb` (the enemy regained HP) / `land` (an enfeebling spell that worked on an enemy)
 - A multi-hit weapon skill or pet ability is recorded as one line with the total of all hits (`hits` is the number that landed).
 - Spells are recorded only when the message is a damage message (buffs, haste and so on are not recorded). A pet's buff (ward) blood pact is not recorded either.
 - `tp` is the TP **just before** the weapon skill.
@@ -91,7 +92,7 @@ One line of `log.csv` is one action's result on one enemy (an area attack adds o
 ## Tips for comparing
 
 - Damage varies a lot. Do not conclude from a few samples. `compare` treats a |t| below a threshold as no difference, and the threshold is larger when there are fewer records: about 2.8 with 3 per set, about 2.1 with 10, about 2.0 with many. It is larger still when the two sets vary very differently (up to 4.3 with 3 per set). The confidence width also gets wider with fewer records.
-- **The mean and t use only the records that did damage. Misses and resists are not in the mean** (they are shown separately as the `miss` rate). When the two sets hit at different rates, look at the `miss` rate as well as the mean.
+- **The mean and t use landed hits, including zero damage. Misses, resists and absorbs are excluded** (they are shown separately as the `miss` rate). When the two sets hit at different rates, look at the `miss` rate as well as the mean.
 - **Compare on the same enemy at the same TP.** The enemy's magic defense and resistances change the numbers a lot, even with the same gear. Narrow down with `//setab target` and `//setab tp`. A TP 3000 weapon skill gives nearly fixed damage steps, which makes it easy to compare.
 - Debuffs on the enemy (Geo-Malaise and so on) are not recorded. Keep track of when they were on. The weather and day go into the `weather` and `day` columns.
 
@@ -100,13 +101,19 @@ One line of `log.csv` is one action's result on one enemy (an area attack adds o
 - Messages printed to the chat are in English. Set names and action names are shown in Japanese on a Japanese client (they are converted to Shift-JIS for the chat).
 - **Checked in game** (Japanese client, October 2026): weapon skills (single and multi-hit) and TP, black magic and magic bursts, that buffs and trusts are not recorded, the names and damage of pet abilities (beastmaster and summoner), that a pet's buff blood pacts are not recorded, enfeebling spells landing and resisting on enemies, a weapon skill missing, that earrings and rings count in the set, and the gear and TP at the start of a weapon skill.
 - **Checked in game for the table (HUD)** (0.3.0, Japanese client, October 2026): that the table opens (A on top, B below, the values beside them), the Japanese headings, an action name typed in Japanese with Tab (auto-translate), the list of actions with their Japanese names (no garbled text), moving the table by dragging, resizing it with the wheel, the explanations that appear over the headings, the t value, the difference and the verdict (and how they wrap), and `//setab hud tip off`, `//setab hud size` and `//setab hud reset`.
-- Misses and resists are judged by tables of message numbers (`MISS_MSG` = 188, 282; `RESIST_MSG` = 85, 284, 653-656). I have confirmed miss 188 and resist 85 and 653. The other numbers are not confirmed in game yet. A number that is not in a table is kept raw in the `msg` column, so you can sort them again later.
+- `MISS_MSG`: 188, 282, 324 and 658 (the last two are pet misses). `RESIST_MSG`: 85, 284 and 653–656.
+- `ABSORB_MSG` for enemies: weapon skills 103 and 238, spells 7, pet abilities 103, 238, 102, 306 and 318. Of these miss, resist and absorb messages, only miss 188 and resists 85 and 653 have been confirmed in game.
 - **Checked in game for 0.3.2** (scholar and summoner, Japanese client, October 2026): Aspir is not recorded (message 228); Drain is recorded as damage (message 227, matching the number on screen); black magic, magic bursts and enfeebles are recorded as before; `label` and `name` turn spaces into `_`; the `compare` threshold (2.41 with 5 and 6 records, 1.97 with many) and the table's Japanese text; the table keeps its position after a reload; a summoner's weapon skill keeps its TP and set even when an avatar's ability lands at almost the same moment. Not yet checked in game: the Absorb spells, and the "... and N more actions" line of `report`. A pet ability landing exactly between the start and the result of a weapon skill (the 0.3.1 fix) has not been reproduced in game either; it is covered only by simulated tests.
 - **Not checked on the English client yet.**
 - Using Windower is not permitted by the FFXI Terms of Service. I cannot guarantee that this addon is allowed or that it will not be detected. Use it at your own risk; the author accepts no responsibility.
 
 ## Changelog
 
+* **0.3.3** (tested in simulation only)
+  * Area attacks count once per use for damage statistics. Each use contributes the average damage across its landed targets. Older rows still count individually. `report` shows `uses=`.
+  * Zero damage counts as a hit. Damage messages without a numeric value are skipped. Enemy absorbs and pet misses count toward the miss rate.
+  * Different sets with the same name appear as `name#hash` (for example, `Nyame#1a2b`). Failed CSV writes retain the pending rows and their original character. Reset keeps the previous log in `log.csv.bak`. Set definitions are verified in `sets.tsv.tmp` before replacement, with recovery from `sets.tsv.bak`.
+  * Weapon skill start gear and TP are used only for a matching result. Debug mode reports a missing skill ID at the start.
 * **0.3.2**
   * Fixed: actions that drain MP, TP or stats (Aspir, the Absorb spells and so on) were recorded as damage. Only HP drains (Drain and so on) count as damage now. Lines recorded before 0.3.2 stay in the log and still count in the mean; to get rid of them, erase the log with `//setab reset confirm`, or delete the lines of `log.csv` whose `msg` column is 228, 275, 329-335, 366, 454 and so on.
   * With few records, the confidence width and the "likely a real difference" verdict were too generous. They now use the t distribution: the fewer the records, the wider the width and the higher the threshold (with many records, almost the same as before). The threshold is shown on the verdict line.
